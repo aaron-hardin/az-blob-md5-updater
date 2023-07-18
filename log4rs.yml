@@ -1,0 +1,39 @@
+appenders:
+  stdout:
+    kind: console
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} - [{h({l})}] {t} - {m}{n}"
+
+  file_logger:
+    kind: file
+    path: "log/run.log"
+    encoder:
+      pattern: "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} - [{h({l})}] {t} - {m}{n}"
+    filters:
+    - kind: threshold
+      level: info
+
+root:
+  level: trace
+  appenders:
+    - stdout
+    - file_logger
+
+loggers:
+  azure_core:
+    level: warn
+
+  azure_storage:
+    level: warn
+
+  mio:
+    level: warn
+
+  reqwest:
+    level: warn
+
+  serde_xml_rs:
+    level: warn
+
+  want:
+    level: warn

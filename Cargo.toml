@@ -1,0 +1,24 @@
+[package]
+name = "blob-md5-updater"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+azure_core = { path = "C:\\GITHUB\\azure-sdk-for-rust\\sdk\\core", version = "0.3", default-features = false, features = [
+  "enable_reqwest",
+] }
+azure_storage = { path = "C:\\GITHUB\\azure-sdk-for-rust\\sdk\\storage", version = "0.4", default-features = false, features = [
+  "account",
+] }
+azure_storage_blobs = { path = "C:\\GITHUB\\azure-sdk-for-rust\\sdk\\storage_blobs", version = "0.4" }
+base64 = "0.13"
+clap = {version = "3.1.6", features = ["derive"]}
+futures = "0.3"
+log = "0.4"
+log4rs = "1.1"
+md5 = "0.7"
+# simple_logger = "2.1"
+# simplelog = "0.12"
+tokio = { version = "1.0", features = ["full"] }
