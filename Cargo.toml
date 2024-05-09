@@ -6,13 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-azure_core = { path = "C:\\GITHUB\\azure-sdk-for-rust\\sdk\\core", version = "0.3", default-features = false, features = [
+azure_core = { version = "0.4", default-features = false, features = [
   "enable_reqwest",
 ] }
-azure_storage = { path = "C:\\GITHUB\\azure-sdk-for-rust\\sdk\\storage", version = "0.4", default-features = false, features = [
-  "account",
-] }
-azure_storage_blobs = { path = "C:\\GITHUB\\azure-sdk-for-rust\\sdk\\storage_blobs", version = "0.4" }
+azure_storage = { version = "0.5" }
+azure_storage_blobs = { version = "0.5" }
 base64 = "0.13"
 clap = {version = "3.1.6", features = ["derive"]}
 futures = "0.3"

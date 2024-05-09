@@ -38,17 +38,13 @@ async fn main() -> azure_core::Result<()> {
 	let container_name = args.container_name;
 	let root = args.root;
 
-	let http_client = azure_core::new_http_client();
-
 	log::info!("getting storage client");
 
-	let storage_client =
-		StorageAccountClient::new_sas_token(http_client.clone(), &account, &sas_token)?
-			.storage_client();
+	let storage_client = StorageClient::new_sas_token(account, sas_token)?;
 
 	log::info!("getting container client");
 
-	let container_client = storage_client.container_client(&container_name);
+	let container_client = Arc::new(storage_client.container_client(&container_name));
 
 	// Create a simple streaming channel
 	let (tx, mut rx) = mpsc::channel(100);
@@ -109,7 +105,7 @@ async fn main() -> azure_core::Result<()> {
 									let mut md5context = md5::Context::new();
 									{
 										while let Some(value) = stream.next().await {
-											let value = value?.data.to_vec();
+											let value = value?.data.collect().await?.to_vec();
 											md5context.consume(value);
 										}
 									}
@@ -174,7 +170,7 @@ async fn main() -> azure_core::Result<()> {
 				let mut md5context = md5::Context::new();
 				{
 					while let Some(value) = stream.next().await {
-						let value = value?.data.to_vec();
+						let value = value?.data.collect().await?.to_vec();
 						md5context.consume(value);
 					}
 				}
