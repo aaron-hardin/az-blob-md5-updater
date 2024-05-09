@@ -4,7 +4,6 @@ use azure_storage::core::prelude::*;
 use azure_storage_blobs::prelude::*;
 use clap::Parser;
 use futures::stream::StreamExt;
-//use simplelog::*;
 use tokio::sync::mpsc::{self, Sender};
 
 /// A CLI for checking md5 in blob storage
@@ -20,21 +19,18 @@ struct Cli {
 	container_name: String,
 	#[clap(long)]
 	fixit: bool,
+	#[clap(long, default_value="1024")]
+	chunk_size_kb: u64,
 	#[clap(long)]
 	root: Option<String>,
+	#[clap(long)]
+	experimental_threads: bool,
 }
 
 #[tokio::main]
 async fn main() -> azure_core::Result<()> {
 	let args = Cli::parse();
 
-	//simple_logger::init_with_level(log::Level::Info).unwrap();
-	// CombinedLogger::init(
-	// 	vec![
-	// 		TermLogger::new(LevelFilter::Info, Config::default(), TerminalMode::Mixed, ColorChoice::Auto),
-	// 		WriteLogger::new(LevelFilter::Info, Config::default(), std::fs::File::create("my_rust_binary.log").unwrap()),
-	// 	]
-	// ).unwrap();
 	log4rs::init_file("log4rs.yml", Default::default()).expect("Could not find 'log4rs.yml' log settings file.");
 
 	let account = args.account;
@@ -81,47 +77,125 @@ async fn main() -> azure_core::Result<()> {
 	// drop the original tx so that it doesn't hold up the rx
 	drop(tx);
 
-	//start_blob_thread(container_client.clone(), tx.clone(), String::from("UploadFiles/Docusphere/ABSTR/"));
-	//start_blob_thread(container_client, tx, String::from("UploadFiles/Docusphere/ACH/"));
+	// Starts 5 'threads' to handle the actual calculation
+	if args.experimental_threads {
+		println!("started experimental_threads");
+		let mut tasks: [tokio::task::JoinHandle<azure_core::Result<()>>; 5] = [tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())})];
 
-	let mut count = 0u32;
-	while let Some(blob) = rx.recv().await {
-		log::info!("No MD5 -- {}", blob.name);
-		count += 1;
-		if count % 100 == 0 {
-			log::trace!("{count} -- with no MD5");
+		let mut count = 0u32;
+		loop {
+			let mut maybe_blob = rx.recv().await;
+			if maybe_blob.is_some() {
+				log::info!("No MD5 -- {}", maybe_blob.as_ref().unwrap().name);
+				count += 1;
+				if count % 100 == 0 {
+					log::trace!("{count} -- with no MD5");
+				}
+
+				if args.fixit {
+					// wait for an available thread to take it
+					let mut waiting_for_thread = true;
+					while waiting_for_thread {
+						for i in 0..5 {
+							if tasks[i].is_finished() {
+								let container_client = container_client.clone();
+								let blob = maybe_blob.take().unwrap();
+								let mut new_handle = tokio::spawn(async move {
+									let blob_client = container_client
+										.blob_client(blob.name.clone());
+
+									// TODO: revisit stream size
+									let mut stream = Box::pin(blob_client.get().chunk_size(1024u64 * args.chunk_size_kb).into_stream());
+									let mut md5context = md5::Context::new();
+									{
+										while let Some(value) = stream.next().await {
+											let value = value?.data.to_vec();
+											md5context.consume(value);
+										}
+									}
+									let md5digest = md5context.compute();
+									let md5slice: [u8; 16] = md5digest.into();
+									log::info!("Computed: {:?} for {}", base64::encode(md5slice), blob.name);
+
+									let result = blob_client
+										.set_properties()
+										.set_from_blob_properties(blob.properties)
+										.content_md5(md5digest)
+										.into_future()
+										.await;
+
+									if result.is_err() {
+										log::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
+									}
+
+									Ok(())
+								});
+								std::mem::swap(&mut tasks[i], &mut new_handle);
+								waiting_for_thread = false;
+								break;
+							}
+						}
+
+						if waiting_for_thread {
+							// sleep a little
+							tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+						}
+					}
+				}
+			} else {
+				// no more to rx
+				break;
+			}
 		}
 
-		if args.fixit {
-			let blob_client = container_client
-				.blob_client(blob.name.clone());
+		// wait for the final tasks to finish
+		for task in tasks {
+			if let Err(err) = task.await {
+				println!("Error on task {err}");
+			}
+		}
 
-			// TODO: revisit stream size
-			let mut stream = Box::pin(blob_client.get().chunk_size(1024u64 * 8).into_stream());
-			let mut md5context = md5::Context::new();
-			{
-				while let Some(value) = stream.next().await {
-					let value = value?.data.to_vec();
-					md5context.consume(value);
+		log::info!("Main thread done - found {count} total with no MD5");
+	} else {
+		let mut count = 0u32;
+		while let Some(blob) = rx.recv().await {
+			log::info!("No MD5 -- {}", blob.name);
+			count += 1;
+			if count % 100 == 0 {
+				log::trace!("{count} -- with no MD5");
+			}
+
+			if args.fixit {
+				let blob_client = container_client
+					.blob_client(blob.name.clone());
+
+				// TODO: revisit stream size
+				let mut stream = Box::pin(blob_client.get().chunk_size(1024u64 * args.chunk_size_kb).into_stream());
+				let mut md5context = md5::Context::new();
+				{
+					while let Some(value) = stream.next().await {
+						let value = value?.data.to_vec();
+						md5context.consume(value);
+					}
+				}
+				let md5digest = md5context.compute();
+				let md5slice: [u8; 16] = md5digest.into();
+				log::info!("Computed: {:?} for {}", base64::encode(md5slice), blob.name);
+
+				let result = blob_client
+					.set_properties()
+					.set_from_blob_properties(blob.properties)
+					.content_md5(md5digest)
+					.into_future()
+					.await;
+
+				if result.is_err() {
+					log::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
 				}
 			}
-			let md5digest = md5context.compute();
-			let md5slice: [u8; 16] = md5digest.into();
-			log::info!("Computed: {:?} for {}", base64::encode(md5slice), blob.name);
-
-			let result = blob_client
-				.set_properties()
-				.set_from_blob_properties(blob.properties)
-				.content_md5(md5digest)
-				.into_future()
-				.await;
-
-			if result.is_err() {
-				log::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
-			}
 		}
+		log::info!("Main thread done - found {count} total with no MD5");
 	}
-	log::info!("Main thread done - found {count} total with no MD5");
 
 	Ok(())
 }
@@ -195,7 +269,7 @@ mod unit_tests {
 
 	#[test]
 	fn test_has_less_than() {
-		assert_eq!(true, has_less_than("UploadFiles/Docusphere/@CSVs/", '/', 4));
-		assert_eq!(false, has_less_than("UploadFiles/Docusphere/@CSVs/1-Unprocessed/", '/', 4));
+		assert_eq!(true, has_less_than("UploadFiles/Folder1/@CSVs/", '/', 4));
+		assert_eq!(false, has_less_than("UploadFiles/Folder1/@CSVs/1-Unprocessed/", '/', 4));
 	}
 }
