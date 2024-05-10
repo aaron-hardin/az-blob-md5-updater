@@ -1,10 +1,15 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use azure_storage::core::prelude::*;
+use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::*;
 use clap::Parser;
 use futures::stream::StreamExt;
 use tokio::sync::mpsc::{self, Sender};
+
+// Import the base64 crate Engine trait anonymously so we can
+// call its methods without adding to the namespace.
+use base64::engine::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 /// A CLI for checking md5 in blob storage
 #[derive(Debug, Parser)]
@@ -31,25 +36,24 @@ struct Cli {
 async fn main() -> azure_core::Result<()> {
 	let args = Cli::parse();
 
-	log4rs::init_file("log4rs.yml", Default::default()).expect("Could not find 'log4rs.yml' log settings file.");
-
 	let account = args.account;
 	let sas_token = args.sas_token;
 	let container_name = args.container_name;
 	let root = args.root;
 
-	log::info!("getting storage client");
+	tracing::info!("getting blob service client");
 
-	let storage_client = StorageClient::new_sas_token(account, sas_token)?;
+	let storage_credentials = StorageCredentials::sas_token(sas_token)?;
+	let blob_service_client = BlobServiceClient::new(account, storage_credentials);
 
-	log::info!("getting container client");
+	tracing::info!("getting container client");
 
-	let container_client = Arc::new(storage_client.container_client(&container_name));
+	let container_client = Arc::new(blob_service_client.container_client(&container_name));
 
 	// Create a simple streaming channel
 	let (tx, mut rx) = mpsc::channel(100);
 
-	log::info!("Starting at {root:?}");
+	tracing::info!("Starting at {root:?}");
 	let mut list_blob_resp = match root.as_ref() {
 		Some(root) => container_client.list_blobs().prefix(root.clone()).delimiter("/").into_stream(),
 		None => container_client.list_blobs().delimiter("/").into_stream()
@@ -57,16 +61,14 @@ async fn main() -> azure_core::Result<()> {
 	
 	while let Some(value) = list_blob_resp.next().await {
 		if value.is_err() {
-			log::error!("Err for {root:?} {:?}", value.err());
+			tracing::error!("Err for {root:?} {:?}", value.err());
 			break;
 		}
 		let blob_response = value.unwrap();
 
 		// Iterate down further
-		if let Some(blob_prefix) = blob_response.blobs.blob_prefix {
-			for blob_prefix in blob_prefix {
-				start_blob_thread(container_client.clone(), tx.clone(), blob_prefix.name);
-			}
+		for blob_prefix in blob_response.blobs.prefixes() {
+			start_blob_thread(container_client.clone(), tx.clone(), blob_prefix.name.clone());
 		}
 	}
 
@@ -82,10 +84,10 @@ async fn main() -> azure_core::Result<()> {
 		loop {
 			let mut maybe_blob = rx.recv().await;
 			if maybe_blob.is_some() {
-				log::info!("No MD5 -- {}", maybe_blob.as_ref().unwrap().name);
+				tracing::info!("No MD5 -- {}", maybe_blob.as_ref().unwrap().name);
 				count += 1;
 				if count % 100 == 0 {
-					log::trace!("{count} -- with no MD5");
+					tracing::trace!("{count} -- with no MD5");
 				}
 
 				if args.fixit {
@@ -109,9 +111,8 @@ async fn main() -> azure_core::Result<()> {
 											md5context.consume(value);
 										}
 									}
-									let md5digest = md5context.compute();
-									let md5slice: [u8; 16] = md5digest.into();
-									log::info!("Computed: {:?} for {}", base64::encode(md5slice), blob.name);
+									let md5digest = md5context.compute().0;
+									tracing::info!("Computed: {:?} for {}", BASE64.encode(md5digest), blob.name);
 
 									let result = blob_client
 										.set_properties()
@@ -121,7 +122,7 @@ async fn main() -> azure_core::Result<()> {
 										.await;
 
 									if result.is_err() {
-										log::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
+										tracing::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
 									}
 
 									Ok(())
@@ -151,14 +152,14 @@ async fn main() -> azure_core::Result<()> {
 			}
 		}
 
-		log::info!("Main thread done - found {count} total with no MD5");
+		tracing::info!("Main thread done - found {count} total with no MD5");
 	} else {
 		let mut count = 0u32;
 		while let Some(blob) = rx.recv().await {
-			log::info!("No MD5 -- {}", blob.name);
+			tracing::info!("No MD5 -- {}", blob.name);
 			count += 1;
 			if count % 100 == 0 {
-				log::trace!("{count} -- with no MD5");
+				tracing::trace!("{count} -- with no MD5");
 			}
 
 			if args.fixit {
@@ -174,9 +175,8 @@ async fn main() -> azure_core::Result<()> {
 						md5context.consume(value);
 					}
 				}
-				let md5digest = md5context.compute();
-				let md5slice: [u8; 16] = md5digest.into();
-				log::info!("Computed: {:?} for {}", base64::encode(md5slice), blob.name);
+				let md5digest = md5context.compute().0;
+				tracing::info!("Computed: {:?} for {}", BASE64.encode(md5digest), blob.name);
 
 				let result = blob_client
 					.set_properties()
@@ -186,11 +186,11 @@ async fn main() -> azure_core::Result<()> {
 					.await;
 
 				if result.is_err() {
-					log::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
+					tracing::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
 				}
 			}
 		}
-		log::info!("Main thread done - found {count} total with no MD5");
+		tracing::info!("Main thread done - found {count} total with no MD5");
 	}
 
 	Ok(())
@@ -208,11 +208,11 @@ async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, 
 	let mut count = 0u32;
 	while let Some(item) = queue.pop_front() {
 		if has_less_than(&item, '/', 4) {
-			log::trace!("{item}");
+			tracing::trace!("{item}");
 		}
 		count += 1;
 		if count % 200 == 0 {
-			log::trace!("{starting_prefix} -- {count}");
+			tracing::trace!("{starting_prefix} -- {count}");
 		}
 		let mut list_blob_resp = container_client
 			.list_blobs()
@@ -222,28 +222,26 @@ async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, 
 		
 		while let Some(value) = list_blob_resp.next().await {
 			if value.is_err() {
-				log::error!("Err for {item} {:?}", value.err());
+				tracing::error!("Err for {item} {:?}", value.err());
 				break;
 			}
 			let blob_response = value.unwrap();
 
 			// Send blobs to other thread for processing
-			for b in blob_response.blobs.blobs.iter() {
+			for b in blob_response.blobs.blobs() {
 				if b.properties.content_md5.is_none() {
 					tx.send(b.clone()).await.unwrap();
 				}
 			}
 
 			// Iterate down further
-			if let Some(blob_prefix) = blob_response.blobs.blob_prefix {
-				for blob_prefix in blob_prefix {
-					queue.push_back(blob_prefix.name);
-				}
+			for blob_prefix in blob_response.blobs.prefixes() {
+				queue.push_back(blob_prefix.name.clone());
 			}
 		}
 	}
 
-	log::info!("{starting_prefix} -- total folder count = {count} -- DONE");
+	tracing::info!("{starting_prefix} -- total folder count = {count} -- DONE");
 }
 
 fn has_less_than(s: &str, c: char, mut count: i32) -> bool {
