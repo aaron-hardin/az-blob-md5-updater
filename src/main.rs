@@ -10,6 +10,10 @@ use tokio::sync::mpsc::{self, Sender};
 // call its methods without adding to the namespace.
 use base64::engine::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
 
 /// A CLI for checking md5 in blob storage
 #[derive(Debug, Parser)]
@@ -35,6 +39,29 @@ struct Cli {
 #[tokio::main]
 async fn main() -> azure_core::Result<()> {
 	let args = Cli::parse();
+
+	let console_filter: tracing_subscriber::EnvFilter = "trace,azure_core=warn,azure_storage=warn,hyper_util=warn".into();
+	let file_filter: tracing_subscriber::EnvFilter = "info,azure_core=warn,azure_storage=warn,hyper_util=warn".into();
+	let console_log = tracing_subscriber::fmt::layer()
+		.with_ansi(true)
+		.with_writer(std::io::stderr.with_min_level(tracing::Level::WARN).or_else(std::io::stdout))
+		.with_filter(console_filter);
+	let file_appender = RollingFileAppender::builder()
+		.rotation(Rotation::HOURLY)
+		.filename_prefix("run")
+		.filename_suffix("log")
+		.build("log")
+		.map_err(|err| azure_core::Error::new(azure_core::error::ErrorKind::Other, err))?;
+	let (nb, _g) = tracing_appender::non_blocking(file_appender);
+	let file_log = tracing_subscriber::fmt::layer()
+		.with_writer(nb)
+		.with_ansi(false)
+		.with_filter(file_filter);
+	let subscriber = tracing_subscriber::registry()
+		.with(console_log)
+		.with(file_log);
+	tracing::subscriber::set_global_default(subscriber)
+		.map_err(|err| azure_core::Error::new(azure_core::error::ErrorKind::Other, err))?;
 
 	let account = args.account;
 	let sas_token = args.sas_token;
