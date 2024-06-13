@@ -103,6 +103,7 @@ async fn main() -> azure_core::Result<()> {
 	drop(tx);
 
 	// Starts 5 'threads' to handle the actual calculation
+	// TODO: this should be the only method, with option to control 'thread' count
 	if args.experimental_threads {
 		println!("started experimental_threads");
 		let mut tasks: [tokio::task::JoinHandle<azure_core::Result<()>>; 5] = [tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())})];
@@ -237,6 +238,7 @@ async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, 
 		if has_less_than(&item, '/', 4) {
 			tracing::trace!("{item}");
 		}
+		// TODO: this count is a bit odd because it doesn't really mean anything should instead do blob count and print less often
 		count += 1;
 		if count % 200 == 0 {
 			tracing::trace!("{starting_prefix} -- {count}");
