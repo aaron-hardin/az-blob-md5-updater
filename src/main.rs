@@ -1,10 +1,13 @@
 use core::option::Option::Some;
-use std::{collections::VecDeque, sync::Arc};
+use core::result::Result::Ok;
+use std::sync::Arc;
 
-use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::*;
+use azure_storage_blob::clients::BlobContainerClient;
+use azure_storage_blob::models::{BlobClientSetPropertiesOptions, BlobContainerClientListBlobsOptions, BlobItem};
+use azure_storage_blob::models::method_options::BlobClientDownloadOptions;
 use clap::Parser;
 use futures::stream::StreamExt;
+use futures::TryStreamExt;
 use tokio::sync::mpsc::{self, Sender};
 
 // Import the base64 crate Engine trait anonymously so we can
@@ -38,7 +41,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> azure_core::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 	let args = Cli::parse();
 
 	let console_filter: tracing_subscriber::EnvFilter = "trace,azure_core=warn,azure_storage=warn,hyper_util=warn,typespec_client_core=warn".into();
@@ -47,6 +50,7 @@ async fn main() -> azure_core::Result<()> {
 		.with_ansi(true)
 		.with_writer(std::io::stderr.with_min_level(tracing::Level::WARN).or_else(std::io::stdout))
 		.with_filter(console_filter);
+	// TODO: I don't like the way this rolls...if the tool is running across hour lines then it creates a new file and splits it. if two instances are run then it uses the same file
 	let file_appender = RollingFileAppender::builder()
 		.rotation(Rotation::HOURLY)
 		.filename_prefix("run")
@@ -69,40 +73,17 @@ async fn main() -> azure_core::Result<()> {
 	let container_name = args.container_name;
 	let root = args.root;
 
-	tracing::info!("getting blob service client");
-
-	// TODO: currently using the older azure_storage_blobs and azure_storage_blob, need to migrate to just the newer one
-	let cc = azure_storage_blob::clients::BlobContainerClient::from_url(azure_core::Url::parse(&format!("https://{}.blob.core.windows.net/{}?{}", account, container_name, sas_token)).unwrap(), None, None).unwrap();
-	let cc = Arc::new(cc);
-
-	let storage_credentials = StorageCredentials::sas_token(sas_token)?;
-	let blob_service_client = BlobServiceClient::new(account, storage_credentials);
-
 	tracing::info!("getting container client");
 
-	let container_client = Arc::new(blob_service_client.container_client(&container_name));
+	let container_client = BlobContainerClient::from_url(azure_core::Url::parse(&format!("https://{}.blob.core.windows.net/{}?{}", account, container_name, sas_token))?, None, None)?;
+	let container_client = Arc::new(container_client);
 
 	// Create a simple streaming channel
 	let (tx, mut rx) = mpsc::channel(100);
 
 	tracing::info!("Starting at {root:?}");
-	let mut list_blob_resp = match root.as_ref() {
-		Some(root) => container_client.list_blobs().prefix(root.clone()).delimiter("/").into_stream(),
-		None => container_client.list_blobs().delimiter("/").into_stream()
-	};
-	
-	while let Some(value) = list_blob_resp.next().await {
-		if value.is_err() {
-			tracing::error!("Err for {root:?} {:?}", value.err());
-			break;
-		}
-		let blob_response = value.unwrap();
 
-		// Iterate down further
-		for blob_prefix in blob_response.blobs.prefixes() {
-			start_blob_thread(container_client.clone(), tx.clone(), blob_prefix.name.clone());
-		}
-	}
+	start_blob_thread(container_client.clone(), tx.clone(), root.clone());
 
 	// drop the original tx so that it doesn't hold up the rx
 	drop(tx);
@@ -111,9 +92,7 @@ async fn main() -> azure_core::Result<()> {
 	// Starts 'concurrency' (default 5) 'threads' to handle the actual calculation
 	println!("started processing");
 	let concurrency = args.concurrency as usize;
-	//let mut tasks: Vec<tokio::task::JoinHandle<azure_core::Result<()>>> = Vec::with_capacity(concurrency);
 	let mut tasks: Vec<tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>> = Vec::with_capacity(concurrency);
-	//let mut tasks: [tokio::task::JoinHandle<azure_core::Result<()>>; args.concurrency] = [tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())})];
 	for _i in 0..concurrency {
 		tasks.push(tokio::spawn(async {Ok(())}));
 	}
@@ -122,7 +101,7 @@ async fn main() -> azure_core::Result<()> {
 	loop {
 		let mut maybe_blob = rx.recv().await;
 		if maybe_blob.is_some() {
-			tracing::info!("No MD5 -- {}", maybe_blob.as_ref().unwrap().name);
+			tracing::info!("No MD5 -- {:?}", maybe_blob.as_ref().unwrap().name);
 			count += 1;
 			if count % 100 == 0 {
 				tracing::trace!("{count} -- with no MD5");
@@ -135,8 +114,8 @@ async fn main() -> azure_core::Result<()> {
 					for i in 0..concurrency {
 						if tasks[i].is_finished() {
 							let blob = maybe_blob.take().unwrap();
-							let other_container_client = cc.clone();
-							let mut new_handle = tokio::spawn(update_md5_for_blob(other_container_client, blob, args.chunk_size_kb));
+							let container_client = container_client.clone();
+							let mut new_handle = tokio::spawn(update_md5_for_blob(container_client, blob, args.chunk_size_kb));
 							std::mem::swap(&mut tasks[i], &mut new_handle);
 							waiting_for_thread = false;
 
@@ -189,62 +168,55 @@ async fn main() -> azure_core::Result<()> {
 	Ok(())
 }
 
-fn start_blob_thread(container_client: Arc<ContainerClient>, tx: Sender<Blob>, starting_prefix: String) {
+fn start_blob_thread(container_client: Arc<BlobContainerClient>, tx: Sender<BlobItem>, starting_prefix: Option<String>) {
 	tokio::spawn(async move {
 		// This thread will handle getting blobs and send them to the main thread for processing
-		process_blob(container_client, tx, starting_prefix).await;
+		let result = process_blob(container_client, tx, starting_prefix).await;
+		match result {
+			Ok(()) => {},
+			Err(err) => {
+				tracing::error!("Error processing container, cannot continue: {err}");
+			}
+		}
 	});
 }
 
-async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, starting_prefix: String) {
-	// TODO: currently this is breadth first search, probably should be depth first to get to files faster
-	let mut queue = VecDeque::from([starting_prefix.clone()]);
+async fn process_blob(container_client: Arc<BlobContainerClient>, tx: Sender<BlobItem>, starting_prefix: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 	let mut blob_count = 0u32;
-	while let Some(item) = queue.pop_front() {
-		if has_less_than(&item, '/', 4) {
-			tracing::trace!("{item}");
-		}
-		// TODO: this may print multiple times for the same count since the count and iterations
-		// in the loop are not directly related.
+	let options = match starting_prefix {
+		Some(ref prefix) => Some(BlobContainerClientListBlobsOptions {
+			prefix: Some(prefix.to_string()),
+			..Default::default()
+		}),
+		None => None
+	};
+	let mut list_blob_resp = container_client.list_blobs(options)?;
+
+	while let Some(blob) = list_blob_resp.try_next().await? {
 		if blob_count > 0 && blob_count % 1000 == 0 {
-			tracing::trace!("{starting_prefix} -- {blob_count}");
+			tracing::trace!("{starting_prefix:?} -- {blob_count}");
 		}
-		let mut list_blob_resp = container_client
-			.list_blobs()
-			.prefix(item.clone())
-			.delimiter("/")
-			.into_stream();
-		
-		while let Some(value) = list_blob_resp.next().await {
-			if value.is_err() {
-				tracing::error!("Err for {item} {:?}", value.err());
-				break;
-			}
-			let blob_response = value.unwrap();
 
-			// Send blobs to other thread for processing
-			for b in blob_response.blobs.blobs() {
-				blob_count += 1;
-				if b.properties.content_md5.is_none() {
-					tx.send(b.clone()).await.unwrap();
-				}
+		// Send blobs to other thread for processing
+		blob_count += 1;
+		if let Some(ref props) = blob.properties {
+			if props.content_md5.is_none() {
+				tx.send(blob.clone()).await?;
 			}
-
-			// Iterate down further
-			for blob_prefix in blob_response.blobs.prefixes() {
-				queue.push_back(blob_prefix.name.clone());
-			}
+		} else {
+			tracing::error!("Blob with no properties? -- {:?}", blob.name);
 		}
 	}
 
-	tracing::info!("{starting_prefix} -- total blob count = {blob_count} -- DONE");
+	tracing::info!("{starting_prefix:?} -- total blob count = {blob_count} -- DONE");
+	Ok(())
 }
 
-async fn update_md5_for_blob(container_client: Arc<azure_storage_blob::clients::BlobContainerClient>, blob: Blob, chunk_size_kb: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-	let blob_client = container_client.blob_client(&blob.name);
+async fn update_md5_for_blob(container_client: Arc<BlobContainerClient>, blob: BlobItem, chunk_size_kb: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+	let blob_client = container_client.blob_client(blob.name.as_ref().ok_or_else(|| "Blob name is not present")?);
 
 	// TODO: revisit stream size
-	let options = Some(azure_storage_blob::models::method_options::BlobClientDownloadOptions {
+	let options = Some(BlobClientDownloadOptions {
 		partition_size: Some(std::num::NonZero::new(1024usize * chunk_size_kb).ok_or_else(|| "invalid chunk size")?),
 		..Default::default()
 	});
@@ -257,41 +229,17 @@ async fn update_md5_for_blob(container_client: Arc<azure_storage_blob::clients::
 		}
 	}
 	let md5digest = md5context.compute().0;
-	tracing::info!("Computed: {:?} for {}", BASE64.encode(md5digest), blob.name);
+	tracing::info!("Computed: {:?} for {:?}", BASE64.encode(md5digest), blob.name);
 
-	let prop_options = Some(azure_storage_blob::models::BlobClientSetPropertiesOptions {
+	let prop_options = Some(BlobClientSetPropertiesOptions {
 		blob_content_md5: Some(md5digest.to_vec()),
 		..Default::default()
 	});
 	let result = blob_client.set_properties(prop_options).await;
 
 	if result.is_err() {
-		tracing::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
+		tracing::error!("Failed to update md5 for {:?} -- {:?}", blob.name, result.err());
 	}
 
 	Ok(())
-}
-
-fn has_less_than(s: &str, c: char, mut count: i32) -> bool {
-	for cc in s.chars() {
-		if cc == c {
-			count -= 1;
-			if count == 0 {
-				return false;
-			}
-		}
-	}
-
-	true
-}
-
-#[cfg(test)]
-mod unit_tests {
-	use super::*;
-
-	#[test]
-	fn test_has_less_than() {
-		assert_eq!(true, has_less_than("UploadFiles/Folder1/@CSVs/", '/', 4));
-		assert_eq!(false, has_less_than("UploadFiles/Folder1/@CSVs/1-Unprocessed/", '/', 4));
-	}
 }
