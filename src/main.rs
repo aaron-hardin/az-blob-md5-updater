@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 	tracing::info!("getting container client");
 
-	let container_client = BlobContainerClient::from_url(azure_core::Url::parse(&format!("https://{}.blob.core.windows.net/{}?{}", account, container_name, sas_token))?, None, None)?;
+	let container_client = BlobContainerClient::from_url(azure_core::http::Url::parse(&format!("https://{}.blob.core.windows.net/{}?{}", account, container_name, sas_token))?, None, None)?;
 	let container_client = Arc::new(container_client);
 
 	// Create a simple streaming channel

@@ -7,10 +7,9 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-azure_core = { version = "0.20", default-features = false, features = [
-  "enable_reqwest",
+azure_core = { version = "0.35", default-features = false, features = [
+  "xml",
 ] }
-azure_storage = { version = "0.20" }
 azure_storage_blob = "0.12.0"
 base64 = "0.22.1"
 clap = {version = "3.1.6", features = ["derive"]}
