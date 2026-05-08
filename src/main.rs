@@ -1,3 +1,4 @@
+use core::option::Option::Some;
 use std::{collections::VecDeque, sync::Arc};
 
 use azure_storage::StorageCredentials;
@@ -29,18 +30,18 @@ struct Cli {
 	#[clap(long)]
 	fixit: bool,
 	#[clap(long, default_value="1024")]
-	chunk_size_kb: u64,
+	chunk_size_kb: usize,
 	#[clap(long)]
 	root: Option<String>,
-	#[clap(long)]
-	experimental_threads: bool,
+	#[clap(long, default_value="5")]
+	concurrency: u8,
 }
 
 #[tokio::main]
 async fn main() -> azure_core::Result<()> {
 	let args = Cli::parse();
 
-	let console_filter: tracing_subscriber::EnvFilter = "trace,azure_core=warn,azure_storage=warn,hyper_util=warn".into();
+	let console_filter: tracing_subscriber::EnvFilter = "trace,azure_core=warn,azure_storage=warn,hyper_util=warn,typespec_client_core=warn".into();
 	let file_filter: tracing_subscriber::EnvFilter = "info,azure_core=warn,azure_storage=warn,hyper_util=warn".into();
 	let console_log = tracing_subscriber::fmt::layer()
 		.with_ansi(true)
@@ -69,6 +70,10 @@ async fn main() -> azure_core::Result<()> {
 	let root = args.root;
 
 	tracing::info!("getting blob service client");
+
+	// TODO: currently using the older azure_storage_blobs and azure_storage_blob, need to migrate to just the newer one
+	let cc = azure_storage_blob::clients::BlobContainerClient::from_url(azure_core::Url::parse(&format!("https://{}.blob.core.windows.net/{}?{}", account, container_name, sas_token)).unwrap(), None, None).unwrap();
+	let cc = Arc::new(cc);
 
 	let storage_credentials = StorageCredentials::sas_token(sas_token)?;
 	let blob_service_client = BlobServiceClient::new(account, storage_credentials);
@@ -102,124 +107,84 @@ async fn main() -> azure_core::Result<()> {
 	// drop the original tx so that it doesn't hold up the rx
 	drop(tx);
 
-	// Starts 5 'threads' to handle the actual calculation
-	// TODO: this should be the only method, with option to control 'thread' count
-	if args.experimental_threads {
-		println!("started experimental_threads");
-		let mut tasks: [tokio::task::JoinHandle<azure_core::Result<()>>; 5] = [tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())})];
+	// TODO: this needs testing/cleanup
+	// Starts 'concurrency' (default 5) 'threads' to handle the actual calculation
+	println!("started processing");
+	let concurrency = args.concurrency as usize;
+	//let mut tasks: Vec<tokio::task::JoinHandle<azure_core::Result<()>>> = Vec::with_capacity(concurrency);
+	let mut tasks: Vec<tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>> = Vec::with_capacity(concurrency);
+	//let mut tasks: [tokio::task::JoinHandle<azure_core::Result<()>>; args.concurrency] = [tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())}), tokio::spawn(async {Ok(())})];
+	for _i in 0..concurrency {
+		tasks.push(tokio::spawn(async {Ok(())}));
+	}
 
-		let mut count = 0u32;
-		loop {
-			let mut maybe_blob = rx.recv().await;
-			if maybe_blob.is_some() {
-				tracing::info!("No MD5 -- {}", maybe_blob.as_ref().unwrap().name);
-				count += 1;
-				if count % 100 == 0 {
-					tracing::trace!("{count} -- with no MD5");
-				}
-
-				if args.fixit {
-					// wait for an available thread to take it
-					let mut waiting_for_thread = true;
-					while waiting_for_thread {
-						for i in 0..5 {
-							if tasks[i].is_finished() {
-								let container_client = container_client.clone();
-								let blob = maybe_blob.take().unwrap();
-								let mut new_handle = tokio::spawn(async move {
-									let blob_client = container_client
-										.blob_client(blob.name.clone());
-
-									// TODO: revisit stream size
-									let mut stream = Box::pin(blob_client.get().chunk_size(1024u64 * args.chunk_size_kb).into_stream());
-									let mut md5context = md5::Context::new();
-									{
-										while let Some(value) = stream.next().await {
-											let value = value?.data.collect().await?.to_vec();
-											md5context.consume(value);
-										}
-									}
-									let md5digest = md5context.compute().0;
-									tracing::info!("Computed: {:?} for {}", BASE64.encode(md5digest), blob.name);
-
-									let result = blob_client
-										.set_properties()
-										.set_from_blob_properties(blob.properties)
-										.content_md5(md5digest)
-										.into_future()
-										.await;
-
-									if result.is_err() {
-										tracing::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
-									}
-
-									Ok(())
-								});
-								std::mem::swap(&mut tasks[i], &mut new_handle);
-								waiting_for_thread = false;
-								break;
-							}
-						}
-
-						if waiting_for_thread {
-							// sleep a little
-							tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-						}
-					}
-				}
-			} else {
-				// no more to rx
-				break;
-			}
-		}
-
-		// wait for the final tasks to finish
-		for task in tasks {
-			if let Err(err) = task.await {
-				println!("Error on task {err}");
-			}
-		}
-
-		tracing::info!("Main thread done - found {count} total with no MD5");
-	} else {
-		let mut count = 0u32;
-		while let Some(blob) = rx.recv().await {
-			tracing::info!("No MD5 -- {}", blob.name);
+	let mut count = 0u32;
+	loop {
+		let mut maybe_blob = rx.recv().await;
+		if maybe_blob.is_some() {
+			tracing::info!("No MD5 -- {}", maybe_blob.as_ref().unwrap().name);
 			count += 1;
 			if count % 100 == 0 {
 				tracing::trace!("{count} -- with no MD5");
 			}
 
 			if args.fixit {
-				let blob_client = container_client
-					.blob_client(blob.name.clone());
+				// wait for an available thread to take it
+				let mut waiting_for_thread = true;
+				while waiting_for_thread {
+					for i in 0..concurrency {
+						if tasks[i].is_finished() {
+							let blob = maybe_blob.take().unwrap();
+							let other_container_client = cc.clone();
+							let mut new_handle = tokio::spawn(update_md5_for_blob(other_container_client, blob, args.chunk_size_kb));
+							std::mem::swap(&mut tasks[i], &mut new_handle);
+							waiting_for_thread = false;
 
-				// TODO: revisit stream size
-				let mut stream = Box::pin(blob_client.get().chunk_size(1024u64 * args.chunk_size_kb).into_stream());
-				let mut md5context = md5::Context::new();
-				{
-					while let Some(value) = stream.next().await {
-						let value = value?.data.collect().await?.to_vec();
-						md5context.consume(value);
+							// print error for new_handle (which now has the completed task), if any
+							// Note: await is fine here because we know the task is already completed since we checked is_finished() above
+							match new_handle.await {
+								Ok(Ok(())) => {},
+								Ok(Err(err)) => {
+									tracing::error!("Error processing blob: {err}");
+								},
+								Err(err) => {
+									tracing::error!("JoinError on task {err}");
+								}
+							}
+							break;
+						}
+					}
+
+					if waiting_for_thread {
+						// sleep a little
+						tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 					}
 				}
-				let md5digest = md5context.compute().0;
-				tracing::info!("Computed: {:?} for {}", BASE64.encode(md5digest), blob.name);
+			}
+		} else {
+			// no more to rx
+			break;
+		}
+	}
 
-				let result = blob_client
-					.set_properties()
-					.set_from_blob_properties(blob.properties)
-					.content_md5(md5digest)
-					.into_future()
-					.await;
+	tracing::info!("Waiting for tasks to finish...");
 
-				if result.is_err() {
-					tracing::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
-				}
+	// wait for the final tasks to finish
+	for task in tasks {
+		match task.await {
+			Ok(Ok(())) => {
+				//tracing::info!("Task finished");
+			},
+			Ok(Err(err)) => {
+				tracing::error!("Error processing blob: {err}");
+			},
+			Err(err) => {
+				tracing::error!("JoinError on task {err}");
 			}
 		}
-		tracing::info!("Main thread done - found {count} total with no MD5");
 	}
+
+	tracing::info!("Main thread done - found {count} total with no MD5");
 
 	Ok(())
 }
@@ -232,16 +197,17 @@ fn start_blob_thread(container_client: Arc<ContainerClient>, tx: Sender<Blob>, s
 }
 
 async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, starting_prefix: String) {
+	// TODO: currently this is breadth first search, probably should be depth first to get to files faster
 	let mut queue = VecDeque::from([starting_prefix.clone()]);
-	let mut count = 0u32;
+	let mut blob_count = 0u32;
 	while let Some(item) = queue.pop_front() {
 		if has_less_than(&item, '/', 4) {
 			tracing::trace!("{item}");
 		}
-		// TODO: this count is a bit odd because it doesn't really mean anything should instead do blob count and print less often
-		count += 1;
-		if count % 200 == 0 {
-			tracing::trace!("{starting_prefix} -- {count}");
+		// TODO: this may print multiple times for the same count since the count and iterations
+		// in the loop are not directly related.
+		if blob_count > 0 && blob_count % 1000 == 0 {
+			tracing::trace!("{starting_prefix} -- {blob_count}");
 		}
 		let mut list_blob_resp = container_client
 			.list_blobs()
@@ -258,6 +224,7 @@ async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, 
 
 			// Send blobs to other thread for processing
 			for b in blob_response.blobs.blobs() {
+				blob_count += 1;
 				if b.properties.content_md5.is_none() {
 					tx.send(b.clone()).await.unwrap();
 				}
@@ -270,7 +237,39 @@ async fn process_blob(container_client: Arc<ContainerClient>, tx: Sender<Blob>, 
 		}
 	}
 
-	tracing::info!("{starting_prefix} -- total folder count = {count} -- DONE");
+	tracing::info!("{starting_prefix} -- total blob count = {blob_count} -- DONE");
+}
+
+async fn update_md5_for_blob(container_client: Arc<azure_storage_blob::clients::BlobContainerClient>, blob: Blob, chunk_size_kb: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+	let blob_client = container_client.blob_client(&blob.name);
+
+	// TODO: revisit stream size
+	let options = Some(azure_storage_blob::models::method_options::BlobClientDownloadOptions {
+		partition_size: Some(std::num::NonZero::new(1024usize * chunk_size_kb).ok_or_else(|| "invalid chunk size")?),
+		..Default::default()
+	});
+	let mut stream = blob_client.download(options).await?.body;
+	
+	let mut md5context = md5::Context::new();
+	{
+		while let Some(value) = stream.next().await {
+			md5context.consume(value?);
+		}
+	}
+	let md5digest = md5context.compute().0;
+	tracing::info!("Computed: {:?} for {}", BASE64.encode(md5digest), blob.name);
+
+	let prop_options = Some(azure_storage_blob::models::BlobClientSetPropertiesOptions {
+		blob_content_md5: Some(md5digest.to_vec()),
+		..Default::default()
+	});
+	let result = blob_client.set_properties(prop_options).await;
+
+	if result.is_err() {
+		tracing::error!("Failed to update md5 for {} -- {:?}", blob.name, result.err());
+	}
+
+	Ok(())
 }
 
 fn has_less_than(s: &str, c: char, mut count: i32) -> bool {
