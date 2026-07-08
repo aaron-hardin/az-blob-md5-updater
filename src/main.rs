@@ -200,9 +200,23 @@ async fn process_blob(container_client: Arc<BlobContainerClient>, tx: Sender<Blo
 		// Send blobs to other thread for processing
 		blob_count += 1;
 		if let Some(ref props) = blob.properties {
-			if props.content_md5.is_none() {
-				tx.send(blob.clone()).await?;
+			match props.content_md5 {
+				Some(ref md5) => {
+					if md5.is_empty() {
+						tracing::info!("Blob with empty MD5 -- {:?}", blob.name);
+						tx.send(blob.clone()).await?;
+					}
+					//tracing::trace!("Blob has MD5 -- {:?} -- {:?}", blob.name, BASE64.encode(md5));
+					// noop
+				},
+				None => {
+					tracing::info!("Blob with no MD5 -- {:?}", blob.name);
+					tx.send(blob.clone()).await?;
+				}
 			}
+			// if props.content_md5.is_none() {
+			// 	tx.send(blob.clone()).await?;
+			// }
 		} else {
 			tracing::error!("Blob with no properties? -- {:?}", blob.name);
 		}
